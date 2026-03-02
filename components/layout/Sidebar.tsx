@@ -2,13 +2,14 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Receipt, PieChart, Wallet } from 'lucide-react';
+import { LayoutDashboard, Receipt, PieChart, Store, Wallet } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const navItems = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/expenses', label: 'Expenses', icon: Receipt },
   { href: '/analytics/categories', label: 'Categories', icon: PieChart },
+  { href: '/analytics/vendors', label: 'Vendors', icon: Store },
 ];
 
 export default function Sidebar() {
