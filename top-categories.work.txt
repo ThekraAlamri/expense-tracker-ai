@@ -1,0 +1,44 @@
+FEATURE: Top Expense Categories Page
+BRANCH: feature/top-categories
+STATUS: Complete — merged to master, build passing
+
+WHAT WAS IMPLEMENTED
+====================
+A full-page analytics view at /analytics/categories that ranks all expense categories
+by total spend. Shows a summary header (total spend, category count, top category)
+and a ranked list with icon, name, amount, transaction count, percentage of total,
+and a proportional colour-coded progress bar per category.
+
+FILES CREATED / MODIFIED
+=========================
++ app/analytics/categories/page.tsx   (103 lines)
+    'use client' page component. Reads data via useExpenses() hook. Uses
+    categorySummaries (pre-computed by the hook) for the ranked list.
+    Renders loading spinner, empty state, summary cards, and ranked rows.
+    Category icon and colour sourced from CATEGORY_ICONS / CATEGORY_COLORS maps.
+
+~ components/layout/Sidebar.tsx       (3 lines changed)
+    Replaced TrendingUp import with PieChart. Added
+    { href: '/analytics/categories', label: 'Categories', icon: PieChart }
+    to navItems array.
+
+NOTE: After merging with feature/top-vendors, Sidebar.tsx was further updated
+to include both the Categories and Vendors nav items in a single resolved file.
+
+DEPENDENCIES ADDED
+==================
+None. All imports are from existing packages (react, lucide-react, @/lib/*, @/components/ui/Card).
+
+BUILD RESULT
+============
+PASS — npm run build in main repo after merge:
+  ✓ Compiled successfully
+  ○ /analytics/categories  (Static, prerendered)
+
+INTEGRATION NOTES
+=================
+- No new dependencies required.
+- Sidebar conflict with feature/top-vendors was resolved manually: both nav items
+  (Categories + Vendors) retained in merged Sidebar.tsx on master.
+- useExpenses() provides categorySummaries directly; no new store functions needed.
+- Route: /analytics/categories (Next.js App Router, static page).

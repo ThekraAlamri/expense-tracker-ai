@@ -1,0 +1,51 @@
+FEATURE: Top Vendors Page
+BRANCH: feature/top-vendors
+STATUS: Complete — merged to master, build passing
+
+WHAT WAS IMPLEMENTED
+====================
+A full-page analytics view at /analytics/vendors that aggregates expenses by their
+description field (used as vendor/merchant name) and ranks them by total spend.
+Shows up to the top 20 vendors. Includes a live search input that filters the list
+by vendor name.
+
+Each vendor row shows: rank (gold/silver/bronze colouring for top 3), vendor name,
+total spend, transaction count, average transaction amount, and a violet progress
+bar proportional to the top vendor's spend.
+
+FILES CREATED / MODIFIED
+=========================
++ app/analytics/vendors/page.tsx      (135 lines)
+    'use client' page component. Reads expenses via useExpenses() hook and computes
+    vendor aggregations with useMemo (Map keyed by description, sorted desc by total,
+    sliced to top 20). Second useMemo drives search filtering. Renders loading spinner,
+    empty state, summary cards, search input, and ranked vendor rows.
+
+~ components/layout/Sidebar.tsx       (3 lines changed)
+    Replaced TrendingUp import with Store. Added
+    { href: '/analytics/vendors', label: 'Vendors', icon: Store }
+    to navItems array.
+
+NOTE: After merging with feature/top-categories, Sidebar.tsx was further updated
+to include both the Categories and Vendors nav items in a single resolved file.
+
+DEPENDENCIES ADDED
+==================
+None. All imports are from existing packages (react, lucide-react, @/lib/*, @/components/ui/Card).
+
+BUILD RESULT
+============
+PASS — npm run build in main repo after merge:
+  ✓ Compiled successfully
+  ○ /analytics/vendors  (Static, prerendered)
+
+INTEGRATION NOTES
+=================
+- No new dependencies required.
+- Vendor aggregation is done client-side from the expenses array; no new store
+  functions needed. If the expense list grows very large (10 000+ items), moving
+  aggregation into lib/store.ts as a getVendorSummaries() function would be advisable.
+- Sidebar conflict with feature/top-categories was resolved manually: both nav items
+  (Categories + Vendors) retained in merged Sidebar.tsx on master.
+- Route: /analytics/vendors (Next.js App Router, static page).
+- Search is synchronous (no debounce) — acceptable for top-20 lists.
