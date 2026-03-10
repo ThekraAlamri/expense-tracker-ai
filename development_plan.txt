@@ -1,0 +1,725 @@
+================================================================================
+ML-POWERED EXPENSE CATEGORIZATION SYSTEM — COMPREHENSIVE TECHNICAL PLAN
+Date: 2026-03-09
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1: CORE TECHNICAL CHALLENGES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1.1 COLD START PROBLEM
+─────────────────────
+New users have zero transaction history. The model has nothing to personalize on.
+Solutions:
+  - Bootstrap with a global pre-trained model (trained on anonymized aggregate data)
+  - Merchant Category Code (MCC) lookup as a prior (banks attach 4-digit codes)
+  - Curated merchant-to-category mapping table for the top 10,000 merchants
+  - Prompt new users for a few manual categorizations to seed the personal model
+  - Use demographic/geographic signals (opt-in) to select a closer base model
+
+1.2 CLASS IMBALANCE
+────────────────────
+"Food & Dining" and "Shopping" dwarf categories like "Medical" or "Pet Care".
+Solutions:
+  - Stratified sampling during training
+  - Class-weighted loss functions (higher penalty for minority class errors)
+  - SMOTE-style oversampling in feature space (not raw text)
+  - Evaluate with macro-averaged F1, not accuracy
+
+1.3 AMBIGUOUS MERCHANT NAMES
+─────────────────────────────
+Raw bank transaction strings are noisy and cryptic:
+  "AMZN Mktp US*2X9K3" → could be Books, Electronics, Groceries, etc.
+  "SQ *BLUE BOTTLE COF" → Coffee (easy) but amount matters: $4 vs $400
+Solutions:
+  - Merchant name normalization via regex cleaning + fuzzy matching
+  - Combine merchant name + amount + time-of-day + day-of-week as joint features
+  - Maintain a merchant resolution database with fallback to substring matching
+  - Use transaction amount as a strong signal (e.g., $4.50 → Coffee, $45 → Dining)
+
+1.4 MULTI-LABEL CATEGORIZATION
+───────────────────────────────
+One transaction can span categories: a Walmart run buys groceries AND medicine.
+Solutions:
+  - Offer sub-category splitting (user can split one transaction into N categories)
+  - Predict a primary category (required) + optional secondary tag
+  - Store split ratios in the data model for future training
+
+1.5 CONTINUOUS LEARNING WITHOUT CATASTROPHIC FORGETTING
+────────────────────────────────────────────────────────
+As users correct categories, the model should adapt — but not "forget" reliable patterns.
+Solutions:
+  - Elastic Weight Consolidation (EWC) for neural models
+  - Replay buffer: keep a small random sample of old training data in each update batch
+  - Ensemble: frozen global model + lightweight personal adapter (the personal model
+    overrides only when its confidence exceeds the global model's)
+  - Periodic full retraining on a fixed schedule (weekly) rather than continuous updates
+
+1.6 REAL-TIME INFERENCE CONSTRAINTS
+─────────────────────────────────────
+Categorization should feel instant (< 200ms perceived latency).
+Solutions:
+  - Lightweight model for initial categorization (DistilBERT or TF-IDF + LR)
+  - Heavier model runs asynchronously to refine in background
+  - Cache predictions for known merchants (LRU cache keyed by normalized merchant name)
+  - Pre-compute embeddings for all known merchants at import time
+
+1.7 FEEDBACK LOOP QUALITY
+──────────────────────────
+User corrections are noisy: typos, inconsistent personal taxonomy, rage-clicks.
+Solutions:
+  - Require explicit confirmation (not just passive acceptance) to use as training signal
+  - Outlier detection: flag corrections that deviate strongly from global patterns
+  - Weight corrections by recency and user engagement score
+  - "Teaching mode" UI: surfaced only when user has time, not mid-transaction
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2: DATA COLLECTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2.1 TRANSACTION DATA SCHEMA
+─────────────────────────────
+Every transaction record should store:
+
+  Core (required):
+    - transaction_id       UUID, immutable
+    - user_id              pseudonymized (see Section 4)
+    - merchant_name_raw    exact string from bank feed
+    - merchant_name_clean  normalized (regex + lookup applied)
+    - amount               decimal, signed (negative = debit)
+    - currency             ISO 4217
+    - timestamp            UTC epoch
+    - transaction_type     [debit, credit, transfer, refund]
+
+  Enrichment (derived or optional):
+    - mcc_code             Merchant Category Code from bank (if available)
+    - day_of_week          0–6
+    - hour_of_day          0–23
+    - is_recurring         boolean (detected via pattern matching)
+    - merchant_id          resolved canonical ID from merchant DB
+
+  Labels (ground truth):
+    - category_auto        model's prediction
+    - category_confidence  float 0–1
+    - category_final       user-confirmed category (null until confirmed)
+    - label_source         [model, rule, user, import_hint]
+    - corrected_at         timestamp of user correction (null if not corrected)
+
+2.2 DATA INGESTION SOURCES
+────────────────────────────
+  Priority 1 — Bank Feeds via Plaid / TrueLayer / Finicity:
+    - OAuth-based, returns normalized OFX-like transaction objects
+    - MCC codes often included; use them as high-confidence priors
+    - Poll or webhook-based; store raw response for auditability
+
+  Priority 2 — CSV / OFX / QFX Import:
+    - User uploads bank export
+    - Parser handles multiple bank formats (regex-based column detection)
+    - Batch categorization at import; show preview before confirming
+
+  Priority 3 — Manual Entry:
+    - User manually adds transactions
+    - Merchant name autocomplete from known merchant DB
+    - User selects category at entry time (training signal with confidence=1.0)
+
+2.3 FEEDBACK DATA COLLECTION
+──────────────────────────────
+Every user interaction is a signal:
+
+  Explicit signals (high value):
+    - User changes predicted category → (transaction_features, new_category)
+    - User confirms suggestion (checkmark) → positive reinforcement
+    - User creates a rule "Always categorize X as Y" → deterministic override
+
+  Implicit signals (lower value, use carefully):
+    - User views transaction details without correcting → weak positive signal
+    - User deletes transaction → may indicate miscategorization or privacy concern
+    - Dwell time on categorization screen → proxy for uncertainty/disagreement
+
+2.4 MERCHANT DATABASE
+───────────────────────
+  Build and maintain a canonical merchant registry:
+    - merchant_id, canonical_name, category, sub_category, mcc_code, country
+    - Seed from public datasets: Open Street Map, Google Places API, MCC code lists
+    - Community-sourced corrections (aggregated and reviewed)
+    - Version-controlled, deployed as a lookup table artifact
+    - Fuzzy-match new merchant names against registry at ingestion time
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3: ML APPROACHES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+3.1 ARCHITECTURE OVERVIEW — THREE-LAYER SYSTEM
+───────────────────────────────────────────────
+
+  Layer 1: Rule Engine (deterministic, ~30% of transactions)
+  ┌──────────────────────────────────────────────────────┐
+  │ - User-defined rules ("Always: Costco → Groceries")  │
+  │ - MCC code lookup table (high confidence)            │
+  │ - Exact merchant name match in merchant DB           │
+  │ OUTPUT: category + confidence=1.0                    │
+  └──────────────────────────────────────────────────────┘
+            │ (if no rule matches, pass to Layer 2)
+            ▼
+
+  Layer 2: Global ML Model (covers most remaining transactions)
+  ┌──────────────────────────────────────────────────────┐
+  │ - Pre-trained on aggregate anonymized data           │
+  │ - Fast inference (< 50ms)                            │
+  │ - Outputs: category + confidence score               │
+  │ OUTPUT: category + confidence                        │
+  └──────────────────────────────────────────────────────┘
+            │ (if confidence > threshold AND user has few corrections)
+            │ (pass to Layer 3 for personalization)
+            ▼
+
+  Layer 3: Personal Adapter Model (per-user fine-tuning)
+  ┌──────────────────────────────────────────────────────┐
+  │ - Lightweight model trained on user's corrections    │
+  │ - Overrides Layer 2 when personal confidence higher  │
+  │ - Re-trained weekly or after N new corrections       │
+  │ OUTPUT: final category + merged confidence           │
+  └──────────────────────────────────────────────────────┘
+
+3.2 GLOBAL MODEL — RECOMMENDED APPROACH
+─────────────────────────────────────────
+
+  Baseline (ship first, high accuracy/low cost):
+    Model:      TF-IDF vectorizer + Logistic Regression
+    Features:   cleaned merchant name tokens + amount bucket + time features
+    Accuracy:   ~82–88% on well-formed data
+    Inference:  < 5ms, tiny memory footprint
+    Training:   minutes on CPU
+    Rationale:  Explainable, fast to iterate, easy to debug
+
+  Production upgrade (after baseline validated):
+    Model:      DistilBERT fine-tuned for sequence classification
+    Features:   "[CLS] merchant_name [SEP] $amount [SEP] day_time_bucket [SEP]"
+    Accuracy:   ~91–95% on same data
+    Inference:  ~40ms CPU / ~8ms GPU
+    Training:   hours on GPU, manageable cost
+    Rationale:  Handles merchant name variations, abbreviations, multi-language
+
+  Feature engineering for tabular features (feed into both models):
+    - amount_log = log1p(abs(amount))          # compress scale
+    - amount_bucket = qcut(amount, 10)         # decile bucket
+    - hour_sin/cos = sin/cos(2π * hour / 24)  # cyclical encoding
+    - dow_sin/cos = sin/cos(2π * dow / 7)     # cyclical encoding
+    - is_weekend = bool
+    - is_recurring = bool
+    - merchant_freq_global = how often this merchant appears (log scale)
+
+3.3 PERSONAL ADAPTER MODEL
+────────────────────────────
+  Architecture: k-Nearest Neighbors on embeddings from the global model
+    - Store user's corrected transactions as (embedding, label) pairs
+    - At inference time: retrieve top-k similar transactions from user history
+    - Weighted vote by similarity + recency
+    - No GPU required, trivially updatable (just append new point)
+    - Fallback to global model if fewer than 10 user corrections exist
+
+  Alternative (for power users with many corrections):
+    - LoRA adapter on top of DistilBERT (low-rank fine-tuning)
+    - Train adapter weights only (< 1% of total params)
+    - Can be stored and loaded per-user efficiently
+
+3.4 CATEGORY TAXONOMY
+───────────────────────
+  Recommended 2-level hierarchy (L1 → L2):
+
+  Food & Dining        → Restaurants, Fast Food, Coffee & Tea, Groceries, Alcohol & Bars
+  Shopping             → Clothing, Electronics, Home & Garden, Online Shopping, Department Stores
+  Transportation       → Gas & Fuel, Public Transit, Ride-sharing, Parking, Auto Maintenance
+  Entertainment        → Movies, Music, Games, Streaming, Events & Concerts
+  Health & Medical     → Pharmacy, Doctor, Dental, Gym & Fitness, Mental Health
+  Home                 → Rent, Mortgage, Utilities, Internet, Home Insurance
+  Travel               → Flights, Hotels, Vacation Rentals, Travel Insurance
+  Financial            → ATM, Bank Fees, Credit Card Payments, Investments, Transfers
+  Personal Care        → Hair & Beauty, Spa, Clothing Accessories
+  Education            → Tuition, Books, Online Courses
+  Gifts & Donations    → Charity, Gifts
+  Business             → Office Supplies, Software Subscriptions, Professional Services
+  Pets                 → Vet, Pet Food, Pet Supplies
+  Uncategorized        → (fallback, triggers review UI)
+
+  Allow users to create custom L2 categories (stored per-user, used in personal model).
+
+3.5 CONFIDENCE THRESHOLDS AND ACTION MAPPING
+─────────────────────────────────────────────
+  confidence >= 0.90   → Auto-categorize silently, show in "Review" tab
+  confidence  0.70–0.89 → Auto-categorize but show "Not sure? Tap to fix" badge
+  confidence  0.50–0.69 → Show top 3 suggestions, ask user to pick
+  confidence < 0.50    → Mark as "Needs Review", surface in review queue
+  Rule match           → Always apply, no confidence UI shown
+
+3.6 MODEL EVALUATION METRICS
+──────────────────────────────
+  Primary:    Macro-averaged F1 (equally weights all categories)
+  Secondary:  Top-3 accuracy (was correct answer in top 3 suggestions?)
+  Business:   Correction rate (% of auto-categorized transactions users correct)
+  Threshold:  Correction rate < 8% is the production quality target
+  Monitoring: Track per-category F1 in production; alert if any category drops > 5pts
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4: PRIVACY AND DATA SECURITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+4.1 DATA MINIMIZATION
+───────────────────────
+  - Never store full card numbers, CVVs, or PINs
+  - Raw bank API tokens stored in secrets manager (AWS Secrets Manager / HashiCorp Vault)
+  - Personal identifiers replaced with pseudonymous UUIDs immediately on ingestion
+  - Amount stored, but merchant names stripped of personal identifiers (e.g., employee names)
+  - Full transaction data retained for 7 years (tax compliance); ML training uses anonymized copies
+
+4.2 DIFFERENTIAL PRIVACY FOR GLOBAL MODEL TRAINING
+────────────────────────────────────────────────────
+  - Apply DP-SGD (Differentially Private Stochastic Gradient Descent) when training global model
+    using Google's tensorflow-privacy or Opacus (PyTorch)
+  - Epsilon target: ε = 4–8 (reasonable utility/privacy tradeoff for financial data)
+  - Gradient clipping threshold: l2_norm_clip = 1.0
+  - Noise multiplier: tuned to achieve target epsilon at end of training
+  - Report epsilon value in privacy disclosures and terms of service
+
+4.3 FEDERATED LEARNING (OPTIONAL — V2)
+───────────────────────────────────────
+  - Instead of sending raw transactions to server for retraining:
+    • Personal model updates computed on-device
+    • Only gradient updates (not raw data) sent to server
+    • Server aggregates updates (FedAvg) to improve global model
+  - Requires mobile/desktop client with compute capability
+  - Use PySyft or TFF (TensorFlow Federated) frameworks
+  - Tradeoff: more complex infra, but strongest privacy guarantee
+
+4.4 ENCRYPTION
+───────────────
+  In transit:
+    - TLS 1.3 for all API endpoints
+    - Certificate pinning in mobile apps
+    - HSTS with minimum 1-year max-age
+
+  At rest:
+    - Database: AES-256 encryption (PostgreSQL with pgcrypto or managed DB encryption)
+    - ML model weights: encrypted at rest in model registry (S3 SSE-KMS)
+    - User-level model adapters: encrypted per user key (derived from user authentication)
+    - Backup encryption: separate KMS keys for backups
+
+4.5 ACCESS CONTROL
+────────────────────
+  - Principle of least privilege: ML training job only accesses anonymized data export
+  - No direct database access from application servers; use database proxy (RDS Proxy)
+  - Row-level security: users can only query their own transactions
+  - Internal staff access: all queries logged, require MFA, break-glass procedure
+  - SOC 2 Type II audit trail for all data access
+
+4.6 USER RIGHTS (GDPR / CCPA COMPLIANCE)
+──────────────────────────────────────────
+  Right to access:      Export all user data as JSON/CSV within 30 days of request
+  Right to deletion:    Hard-delete all personal data; remove from training sets
+                        (training on deleted user data requires retraining or SISA)
+  Right to correction:  User can edit any transaction data
+  Data portability:     Export in standard format (OFX, CSV) for account migration
+  Consent management:   Granular opt-in for: data sharing for model improvement,
+                        marketing analytics, third-party sharing
+  Breach notification:  72-hour notification to regulators, 30-day to affected users
+
+4.7 SECURITY TESTING
+─────────────────────
+  - SAST (Bandit for Python, ESLint security rules for JS) in CI pipeline
+  - DAST: OWASP ZAP against staging environment weekly
+  - Annual penetration test by third-party firm
+  - Bug bounty program post-launch
+  - Dependency scanning: Dependabot / Snyk for CVEs
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 5: USER EXPERIENCE FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+5.1 ONBOARDING FLOW
+────────────────────
+  Step 1: Connect accounts
+    → Bank connection via Plaid OAuth (30s)
+    → Confirm which accounts to import
+
+  Step 2: Initial categorization bootstrap (cold start mitigation)
+    → Show 5–10 transactions with uncertain categorization
+    → Ask user to confirm or correct each (progress bar)
+    → Frame as "Help us learn your spending habits"
+    → Skip option available (reduces personalization quality, shown as tradeoff)
+
+  Step 3: Set up category preferences
+    → Show default category list; allow user to hide/rename/merge categories
+    → Create custom categories (up to 20 user-defined)
+    → Set default category for specific merchants ("Always: Spotify → Entertainment")
+
+  Step 4: Review imported history
+    → Show last 90 days auto-categorized
+    → Highlight low-confidence transactions in "Review" queue
+    → Batch review mode: swipe right to confirm, left to recategorize
+
+5.2 ONGOING TRANSACTION FLOW
+──────────────────────────────
+
+  New transaction appears:
+    │
+    ├─► confidence >= 0.90 → Auto-categorized (silent)
+    │     → Transaction appears in feed with category badge
+    │     → Undo available for 30 seconds (snackbar)
+    │
+    ├─► confidence 0.70–0.89 → Auto-categorized with hint
+    │     → "We think this is [category]. Tap to change."
+    │     → Category badge has a subtle "?" indicator
+    │
+    └─► confidence < 0.70 → Queued for review
+          → Notification badge on "Review" tab
+          → Shows top 3 suggestions with probability bars
+          → User taps to confirm or picks different category
+
+5.3 REVIEW QUEUE UX
+─────────────────────
+  Layout: Card-based review stack
+    ┌─────────────────────────────────┐
+    │ Amazon Fresh                    │
+    │ $67.34 · Yesterday · 2:45 PM   │
+    │                                 │
+    │  ● Groceries         87%       │
+    │  ○ Shopping          9%        │
+    │  ○ Online Shopping   4%        │
+    │                                 │
+    │  [Confirm Groceries]  [Other ▼] │
+    └─────────────────────────────────┘
+
+  Batch mode: Show 10 transactions, confirm all with one tap if agreement
+  Swipe gestures: right=confirm, left=recategorize, up=skip
+  Keyboard shortcut (desktop): 1/2/3 for top suggestions, Enter to confirm
+
+5.4 CATEGORY RULES EDITOR
+───────────────────────────
+  User can create persistent rules:
+    - Merchant-based: "If merchant contains 'Netflix' → Entertainment > Streaming"
+    - Amount-based: "If amount < $5 AND merchant contains 'coffee' → Coffee & Tea"
+    - Pattern-based: "If merchant matches regex → category"
+  Rules displayed in order of precedence (drag to reorder)
+  "Add from transaction" shortcut: right-click any transaction → "Create rule"
+
+5.5 LEARNING FEEDBACK LOOP
+────────────────────────────
+  After user correction:
+    → Model queues retraining (batched, not immediate)
+    → Next similar transaction shows updated prediction
+    → "We remembered your preference" toast on first similar transaction
+  After 10+ corrections:
+    → "Your categories are now personalized" banner
+    → Show correction impact: "You've improved 47 future predictions"
+
+5.6 SETTINGS AND TRANSPARENCY
+───────────────────────────────
+  ML Transparency panel:
+    → "Why was this categorized as X?" (show top features contributing to prediction)
+    → "Model confidence" toggle (show/hide confidence indicators)
+    → "Reset my preferences" (clear personal model, keep rules)
+  Data controls:
+    → "Download my data" button
+    → "Delete account and all data" (with confirmation flow)
+    → "Opt out of model improvement" (transactions not used in global retraining)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6: EDGE CASES AND ERROR HANDLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+6.1 TRANSFERS AND INTERNAL MOVEMENTS
+───────────────────────────────────────
+  Problem: "Transfer to Savings" is not an expense; including it corrupts spending reports.
+  Detection:
+    - Transaction pairs with same amount, opposite signs, within 3 days = likely transfer
+    - Known transfer keywords: "TRANSFER", "ZELLE", "VENMO", "ACH"
+    - MCC 6012 (Financial Institutions) as strong transfer signal
+  Handling:
+    - Classify into "Transfer" meta-category (excluded from expense analytics)
+    - Ask user to confirm on first occurrence of each pattern
+    - "Exclude from budget" checkbox on transaction detail view
+
+6.2 REFUNDS AND CREDITS
+─────────────────────────
+  Problem: A +$45.00 from "United Airlines" could be a refund, a credit, or income.
+  Detection:
+    - Positive amount + known merchant = likely refund
+    - Match against recent debit from same merchant within 30 days
+    - "REFUND", "CREDIT", "REVERSAL" in merchant name
+  Handling:
+    - Auto-link refund to original transaction when match found
+    - Show as "Refund: [original category]" rather than separate entry
+    - Adjust budget/spending totals to net the refund
+
+6.3 RECURRING SUBSCRIPTIONS
+──────────────────────────────
+  Detection:
+    - Same merchant, similar amount (within 5%), same calendar interval (±3 days)
+    - Minimum 2 occurrences to trigger recurring flag
+  Handling:
+    - "Recurring" badge on transaction
+    - "Manage subscriptions" summary view
+    - Alert if subscription amount changes (possible price hike)
+    - Alert if subscription disappears (possible cancellation or failed payment)
+
+6.4 SPLIT TRANSACTIONS
+────────────────────────
+  Problem: One restaurant bill split between Food and Business Entertainment.
+  UI Solution:
+    - "Split transaction" action on any transaction detail view
+    - User enters N splits with amounts and categories (must sum to total)
+    - Stored as parent transaction + child splits; analytics use children
+  ML implication: Do not use split transactions as training examples for the global model
+  (too user-specific). Use only for personal adapter.
+
+6.5 INTERNATIONAL TRANSACTIONS
+───────────────────────────────
+  - Merchant names may be in non-ASCII, non-English text
+  - Currency conversion needed (store original currency + converted amount)
+  - Use multilingual DistilBERT (mBERT) or XLM-RoBERTa for international deployments
+  - Country code from transaction as additional feature
+  - Time zone handling: store UTC, display in user's local time zone
+
+6.6 VERY SMALL OR VERY LARGE AMOUNTS
+───────────────────────────────────────
+  - $0.01 transactions: likely pre-authorization checks → classify as "Bank Fee" or ignore
+  - $0 transactions: informational entries (e.g., "Account opened") → exclude from ML
+  - > $5,000 transactions: more likely to be Rent, Travel, or Medical → use amount bucket feature
+  - Negative outliers: > 3 standard deviations from user's history → flag for review
+
+6.7 ML MODEL FAILURES
+───────────────────────
+  Model unavailable (timeout, crash):
+    → Fall back to rule engine → fall back to MCC lookup → fall back to "Uncategorized"
+    → Log error with transaction_id for async retry
+    → Never block transaction ingestion; categorization is async
+
+  Prediction returns null/NaN:
+    → Treat as confidence=0, route to "Needs Review"
+    → Alert on-call if null rate exceeds 1% over 5-minute window
+
+  Model drift detected:
+    → Automated alert when rolling correction rate exceeds 12% (vs. 8% target)
+    → Freeze personal model updates; investigate root cause
+    → Roll back to previous model version if drift confirmed
+
+6.8 DATA INGESTION ERRORS
+───────────────────────────
+  Bank API returns error:
+    → Retry with exponential backoff (max 3 attempts, max 32s delay)
+    → If persistent, notify user with actionable message ("Reconnect your bank account")
+    → Never silently drop transactions
+
+  Duplicate transactions (bank sometimes sends same transaction twice):
+    → Dedup on (merchant_name_raw, amount, timestamp) within 24-hour window
+    → Keep first seen; log deduplicated records for audit
+
+  Malformed CSV import:
+    → Validate schema before processing; reject with detailed error (which row/column)
+    → Show user preview of first 10 parsed rows for confirmation before import
+    → Store original file in object storage for re-import if parsing improves
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 7: DEPLOYMENT AND MAINTENANCE STRATEGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+7.1 SYSTEM ARCHITECTURE
+─────────────────────────
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                        Client Layer                             │
+  │  Web App (React)    Mobile (React Native)    Browser Extension  │
+  └─────────────────────────┬───────────────────────────────────────┘
+                            │ HTTPS / REST + WebSocket
+  ┌─────────────────────────▼───────────────────────────────────────┐
+  │                        API Gateway                              │
+  │  (Kong / AWS API Gateway)  Auth: JWT + OAuth2                   │
+  └─────────────┬───────────────────────────────┬───────────────────┘
+               │                               │
+  ┌────────────▼──────────────┐   ┌───────────▼────────────────────┐
+  │   Transaction Service      │   │    Categorization Service       │
+  │   (FastAPI, Python)        │   │    (FastAPI, Python)            │
+  │   - Ingest & normalize     │   │    - Rule engine               │
+  │   - Dedup & validate       │   │    - Global ML model inference  │
+  │   - Store to Postgres      │   │    - Personal adapter inference │
+  └────────────┬──────────────┘   └───────────┬────────────────────┘
+               │                               │
+  ┌────────────▼───────────────────────────────▼────────────────────┐
+  │                     Message Queue (Redis Streams / Kafka)        │
+  │   Topics: transactions.new, corrections.made, models.retrain    │
+  └─────────────────────────┬───────────────────────────────────────┘
+                            │
+  ┌─────────────────────────▼───────────────────────────────────────┐
+  │                    ML Training Pipeline                          │
+  │  - Triggered by: schedule (weekly) + correction volume (N>100) │
+  │  - Airflow DAG / Prefect flow                                   │
+  │  - Data: anonymized extract from warehouse                      │
+  │  - Training: containerized (Docker + K8s GPU node)              │
+  │  - Evaluation: automated test on held-out set                   │
+  │  - Registry: MLflow / W&B                                       │
+  └─────────────────────────┬───────────────────────────────────────┘
+                            │
+  ┌─────────────────────────▼───────────────────────────────────────┐
+  │                    Data Warehouse (Snowflake / BigQuery)         │
+  │  - Anonymized transaction features                              │
+  │  - Model performance metrics over time                          │
+  │  - User correction rates, category distributions               │
+  └─────────────────────────────────────────────────────────────────┘
+
+7.2 CI/CD PIPELINE
+────────────────────
+  Code pipeline (GitHub Actions / GitLab CI):
+    PR → lint → unit tests → integration tests → staging deploy → smoke tests
+    Main → production deploy (blue-green) → smoke tests → full test suite
+
+  Model pipeline (triggered separately):
+    Data validation → feature engineering → model training → evaluation gate
+    → (if F1 > threshold) staging shadow mode → (if correction rate OK) production swap
+
+  Quality gates for model promotion:
+    - Macro F1 >= 0.85 on held-out test set
+    - No category drops > 5 F1 points vs. current production model
+    - Prediction latency p99 < 200ms on test hardware
+    - No increase in correction rate in shadow mode (14-day observation window)
+
+7.3 MODEL VERSIONING
+──────────────────────
+  - Every model artifact tagged with: version, training_date, dataset_hash, eval_metrics
+  - Models stored in: S3 bucket with immutable versioning
+  - MLflow Tracking Server records all experiments (hyperparams, metrics, artifacts)
+  - Current production model ID stored in feature flag system (instant rollback)
+  - Keep last 5 model versions available for rollback
+
+7.4 MONITORING AND ALERTING
+────────────────────────────
+  Business metrics (daily dashboard):
+    - Correction rate per category
+    - Auto-categorization rate (% going through silently vs. review queue)
+    - Review queue depth (should empty within 24 hours for active users)
+    - New merchant names not in merchant DB (seeding opportunities)
+
+  Infrastructure metrics (real-time):
+    - Inference latency: p50, p95, p99
+    - Model prediction throughput (transactions/second)
+    - Cache hit rate (merchant name cache)
+    - Error rates by service
+
+  ML-specific metrics (weekly):
+    - Correction rate trend (alert if > 12% over 7-day rolling window)
+    - Per-category precision/recall estimated from corrections
+    - Personal model adoption rate (% users whose corrections improved accuracy)
+    - Cold start conversion rate (% new users completing bootstrap onboarding)
+
+  Alerting stack:
+    - PagerDuty for P1: inference service down, correction rate spike
+    - Slack for P2: model performance degradation, high review queue
+    - Email digest for P3: weekly metric summary
+
+7.5 RETRAINING SCHEDULE
+─────────────────────────
+  Global model:
+    - Weekly retraining (Sunday night, off-peak)
+    - Trigger also if: corrections in last 7 days > 10,000 new labeled examples
+    - Training data: rolling 18-month window of confirmed transactions
+    - Always retrain from base checkpoint (not previous production model)
+      to avoid compounding biases
+
+  Personal adapter:
+    - Retrain after every 10 new user corrections (batched within same session)
+    - Full rebuild weekly (to incorporate any global model updates)
+    - Triggered immediately when user makes their first correction
+
+  Merchant database:
+    - Daily delta updates (new merchants observed in last 24 hours)
+    - Weekly full refresh from external sources
+
+7.6 SCALABILITY PLANNING
+─────────────────────────
+  Inference scaling:
+    - Stateless inference service → horizontal scaling via K8s HPA
+    - Global model loaded once per pod (not per request)
+    - Personal adapter: loaded from S3 per user, LRU cached (evict after 30min idle)
+    - Cache personal models in Redis for active users (< 1MB per user adapter)
+
+  Training scaling:
+    - Small-scale (< 1M transactions): single GPU instance (A100)
+    - Large-scale (> 10M transactions): distributed training with DeepSpeed/FSDP
+    - Feature engineering: Apache Spark on EMR / Dataproc for warehouse-scale data
+
+  Cost optimization:
+    - Use spot/preemptible instances for training (save ~70%)
+    - Inference: start with CPU; GPU only if latency target unmet on CPU
+    - Quantize DistilBERT to INT8 (QAT) for 2-4x CPU speedup with < 1% accuracy loss
+
+7.7 ROLLOUT STRATEGY
+─────────────────────
+  Phase 0 — Internal alpha (weeks 1–4):
+    - Rule engine + MCC lookup only (no ML)
+    - Internal team uses product daily
+    - Build baseline correction rate dataset
+
+  Phase 1 — Closed beta (weeks 5–12):
+    - TF-IDF + Logistic Regression global model
+    - 100 invited beta users
+    - Collect 50,000+ labeled transactions
+    - Iterate on UX based on feedback
+
+  Phase 2 — Open beta (weeks 13–20):
+    - DistilBERT global model (if F1 > 0.88 in phase 1)
+    - Personal adapter enabled for users with > 10 corrections
+    - 10% of new signups (feature flag)
+    - A/B test: baseline (rule-only) vs. ML-assisted
+
+  Phase 3 — General availability:
+    - Full rollout
+    - Federated learning R&D begins
+    - Public accuracy statistics (category-level F1) in transparency report
+
+7.8 INCIDENT RESPONSE
+───────────────────────
+  Model outage:
+    1. Auto-failover to rule engine (handled in code, no manual step)
+    2. Alert on-call ML engineer
+    3. Investigate root cause (logs, metrics)
+    4. Fix + deploy or rollback model
+    5. Post-mortem within 48 hours
+
+  Mass miscategorization (model regression):
+    1. Detection: correction rate alert fires
+    2. Freeze model updates immediately (feature flag)
+    3. Rollback to previous model version
+    4. Notify affected users if correction rate > 20% for > 1 hour
+    5. Root cause analysis: data drift? training bug? label corruption?
+
+  Data breach:
+    1. Isolate affected systems (automated + manual)
+    2. Legal/DPO notification within 1 hour
+    3. Regulator notification within 72 hours
+    4. User notification per jurisdiction requirements
+    5. Forensic investigation + remediation
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IMPLEMENTATION ROADMAP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Sprint 1–2:   Data model, transaction ingestion, CSV/Plaid import
+Sprint 3–4:   Rule engine + MCC lookup, basic category UI
+Sprint 5–6:   TF-IDF + LR global model, confidence scoring, review queue UX
+Sprint 7–8:   Merchant DB seeding, merchant normalization pipeline
+Sprint 9–10:  Personal adapter (kNN on embeddings), user correction feedback loop
+Sprint 11–12: DistilBERT fine-tuning, A/B testing infrastructure
+Sprint 13–14: Privacy controls, GDPR compliance, data export/deletion
+Sprint 15–16: Monitoring dashboards, alerting, retraining pipeline automation
+Sprint 17–18: Performance optimization, load testing, security audit
+Sprint 19–20: Federated learning POC, transparency features, launch prep
+
+================================================================================
+END OF PLAN
+================================================================================
